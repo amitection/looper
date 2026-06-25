@@ -4,7 +4,7 @@
 
 ## The problem
 
-You set up a loop to check deploys every 30 minutes. A week later, it stops. No warning, no error — the cron job just expired. You have to manually re-create it. Every week. For every loop.
+You set up a loop to slack you morning briefs, check pipelines, etc and a week later, it stops. No warning, no error — the cron job just expired. You have to manually re-create it. Every week. For every loop.
 
 Looper fixes this. It keeps a persistent registry of your loops and auto-renews them on every Claude session start.
 
