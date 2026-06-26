@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
-    <img src="assets/banner.png" alt="looper — durable loops for Claude Code. Persist a loop once, recall it in any session without it firing twice." width="820">
+    <img src="assets/banner.png" alt="looper — durable loops for Claude Code" width="440">
   </picture>
 </p>
 
