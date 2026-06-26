@@ -20,9 +20,8 @@ from textual.widgets import (
     TextArea,
 )
 
-from looper.models import CheckResult, Loop, LoopStatus
+from looper.models import Loop, LoopStatus
 from looper.registry import (
-    check,
     parse_loops,
     remove_loop,
     toggle_loop,
@@ -299,85 +298,6 @@ class PromptViewScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
-class CheckResultScreen(ModalScreen[None]):
-    """Modal to display check results."""
-
-    CSS = """
-    CheckResultScreen {
-        align: center middle;
-    }
-    #check-dialog {
-        width: 80;
-        height: auto;
-        max-height: 80%;
-        border: thick $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #check-dialog .title {
-        text-style: bold;
-        margin: 0 0 1 0;
-    }
-    #check-content {
-        height: auto;
-        max-height: 60%;
-        margin: 0 0 1 0;
-    }
-    #check-buttons {
-        height: auto;
-        align: right middle;
-        margin-top: 1;
-    }
-    """
-
-    BINDINGS = [
-        Binding("escape", "close", "Close", show=True),
-    ]
-
-    def __init__(self, result: CheckResult) -> None:
-        super().__init__()
-        self._result = result
-
-    def compose(self) -> ComposeResult:
-        r = self._result
-        with Vertical(id="check-dialog"):
-            yield Label("Check Results", classes="title")
-            with VerticalScroll(id="check-content"):
-                yield Static(self._format_results())
-            yield Static(
-                f"Active: {r.active_count}  "
-                f"Missing: {r.missing_count}  "
-                f"Expiring: {r.expiring_count}  "
-                f"Orphans: {len(r.orphan_jobs)}  "
-                f"Sync needed: {'yes' if r.needs_sync else 'no'}"
-            )
-            if r.message:
-                yield Static(r.message)
-            with Horizontal(id="check-buttons"):
-                yield Button("Close", variant="default", id="check-close")
-
-    def _format_results(self) -> str:
-        lines: list[str] = []
-        for s in self._result.statuses:
-            expiry = ""
-            if s.days_until_expiry is not None:
-                expiry = f"  (expires in {s.days_until_expiry:.1f}d)"
-            lines.append(f"  {s.state.upper():10s}  {s.loop.name}{expiry}")
-        if self._result.orphan_jobs:
-            lines.append("")
-            lines.append("Orphan jobs (no matching loop):")
-            for j in self._result.orphan_jobs:
-                lines.append(f"  {j.id}  {j.name}")
-        return "\n".join(lines) if lines else "No loops found."
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "check-close":
-            self.dismiss(None)
-
-    def action_close(self) -> None:
-        self.dismiss(None)
-
-
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -394,20 +314,31 @@ class LooperApp(App):
         height: 1fr;
     }
     #table-pane {
-        height: 2fr;
+        width: 1fr;
         border: solid $primary;
     }
     #detail-pane {
-        height: 1fr;
+        width: 2fr;
         border: solid $accent;
-        padding: 0 1;
+        padding: 1 2;
     }
-    #detail-title {
+    #detail-name {
         text-style: bold;
+        color: $text;
         margin: 0 0 1 0;
+    }
+    #detail-meta {
+        color: $text-muted;
+        margin: 0 0 1 0;
+    }
+    #detail-prompt-label {
+        text-style: bold;
+        color: $accent;
+        margin: 1 0 0 0;
     }
     #detail-body {
         height: 1fr;
+        margin: 0 0 0 0;
     }
     #status-bar {
         height: 1;
@@ -429,45 +360,52 @@ class LooperApp(App):
         Binding("p", "pause_loop", "Pause"),
         Binding("r", "retrigger", "Retrigger"),
         Binding("d", "delete_loop", "Delete"),
-        Binding("c", "run_check", "Check"),
+        Binding("g", "refresh", "Refresh"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self._loops: list[Loop] = []
         self._statuses: list[LoopStatus] = []
-        self._check_result: CheckResult | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical(id="main-container"):
+        with Horizontal(id="main-container"):
             with VerticalScroll(id="table-pane"):
                 yield DataTable(id="loops-table", cursor_type="row")
             with VerticalScroll(id="detail-pane"):
-                yield Static("Select a loop to view details", id="detail-title")
+                yield Static("Select a loop", id="detail-name")
+                yield Static("", id="detail-meta")
+                yield Static("Prompt", id="detail-prompt-label")
                 yield Static("", id="detail-body")
         yield Static("Loading...", id="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#loops-table", DataTable)
-        table.add_columns("Name", "Interval", "State", "Active", "Expiry")
+        table.add_columns("Name", "Schedule", "Status")
         self._refresh_data()
 
     # -- Data loading -------------------------------------------------------
 
     def _refresh_data(self) -> None:
-        """Reload loops from registry and refresh the table."""
-        try:
-            result = check()
-            self._check_result = result
-            self._statuses = result.statuses
-            self._loops = [s.loop for s in result.statuses]
-        except Exception:
-            # Fallback: just parse loops without job diffing
-            self._loops = parse_loops()
-            self._statuses = [LoopStatus(loop=lp, state="paused" if not lp.active else "unknown") for lp in self._loops]
-            self._check_result = None
+        """Reload loops from the registry and refresh the table.
+
+        Status is running / idle / paused: a loop is *running* if any live
+        session reports hosting it (per-session notes), *idle* if enabled but
+        unhosted, *paused* if disabled in loops.md.
+        """
+        from looper.harvest import running_loop_names
+
+        self._loops = parse_loops()
+        running = running_loop_names()
+        self._statuses = [
+            LoopStatus(
+                loop=lp,
+                state="paused" if not lp.active else ("running" if lp.name in running else "idle"),
+            )
+            for lp in self._loops
+        ]
 
         self._rebuild_table()
         self._update_status_bar()
@@ -476,47 +414,45 @@ class LooperApp(App):
     def _rebuild_table(self) -> None:
         table = self.query_one("#loops-table", DataTable)
         table.clear()
-        for status in self._statuses:
-            lp = status.loop
-            expiry_str = ""
-            if status.days_until_expiry is not None:
-                expiry_str = f"{status.days_until_expiry:.1f}d"
-            table.add_row(
-                lp.name,
-                lp.interval,
-                status.state,
-                "yes" if lp.active else "no",
-                expiry_str,
-                key=lp.name,
-            )
+        for s in self._statuses:
+            table.add_row(s.loop.name, s.loop.interval, s.state, key=s.loop.name)
 
     def _update_status_bar(self) -> None:
         total = len(self._loops)
-        active = sum(1 for lp in self._loops if lp.active)
-        sync = ""
-        if self._check_result and self._check_result.needs_sync:
-            sync = " | SYNC NEEDED"
+        running = sum(1 for s in self._statuses if s.state == "running")
         bar = self.query_one("#status-bar", Static)
-        bar.update(f"Loops: {total}  Active: {active}{sync}")
+        bar.update(f"Loops: {total}  Running: {running}")
 
     def _update_detail_panel(self) -> None:
         """Update the detail panel for the currently selected loop."""
         loop = self._get_selected_loop()
-        title = self.query_one("#detail-title", Static)
-        body = self.query_one("#detail-body", Static)
+        name_w = self.query_one("#detail-name", Static)
+        meta_w = self.query_one("#detail-meta", Static)
+        label_w = self.query_one("#detail-prompt-label", Static)
+        body_w = self.query_one("#detail-body", Static)
         if loop is None:
-            title.update("No loop selected")
-            body.update("")
+            name_w.update("No loop selected")
+            meta_w.update("")
+            label_w.update("")
+            body_w.update("")
             return
         status = self._get_selected_status()
-        state_str = status.state if status else "unknown"
-        meta_parts = [f"Interval: {loop.interval}", f"State: {state_str}"]
+        state_str = status.state if status else "idle"
+
+        name_w.update(loop.name)
+
+        meta_lines = [
+            f"Schedule:  {loop.interval}",
+            f"Status:    {state_str}",
+        ]
         if loop.created_at:
-            meta_parts.append(f"Created: {loop.created_at}")
+            meta_lines.append(f"Created:   {loop.created_at}")
         if loop.paused_at:
-            meta_parts.append(f"Paused: {loop.paused_at}")
-        title.update(f"{loop.name}  ({', '.join(meta_parts)})")
-        body.update(loop.prompt)
+            meta_lines.append(f"Paused:    {loop.paused_at}")
+        meta_w.update("\n".join(meta_lines))
+
+        label_w.update("Prompt")
+        body_w.update(loop.prompt)
 
     # -- Selection helpers --------------------------------------------------
 
@@ -645,18 +581,9 @@ class LooperApp(App):
 
         self.push_screen(ConfirmDeleteScreen(loop.name), callback=on_result)
 
-    def action_run_check(self) -> None:
-        try:
-            result = check()
-            self._check_result = result
-            self._statuses = result.statuses
-            self._loops = [s.loop for s in result.statuses]
-            self._rebuild_table()
-            self._update_status_bar()
-            self._update_detail_panel()
-            self.push_screen(CheckResultScreen(result))
-        except Exception as exc:
-            self.notify(f"Check failed: {exc}", severity="error")
+    def action_refresh(self) -> None:
+        self._refresh_data()
+        self.notify("Refreshed.", title="looper")
 
 
 # ---------------------------------------------------------------------------

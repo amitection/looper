@@ -42,16 +42,15 @@ Clean up old temporary files.
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Redirect all looper paths into tmp_path so tests never touch real dirs."""
     loops_file = tmp_path / "loops.md"
-    canonical = tmp_path / ".claude" / "scheduled_tasks.json"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("[]")
 
     monkeypatch.setattr("looper.LOOPER_HOME", tmp_path)
     monkeypatch.setattr("looper.LOOPS_FILE", loops_file)
-    monkeypatch.setattr("looper.CANONICAL_TASKS", canonical)
     monkeypatch.setattr("looper.registry.LOOPS_FILE", loops_file)
-    monkeypatch.setattr("looper.registry.CANONICAL_TASKS", canonical)
     monkeypatch.setattr("looper.cli.LOOPS_FILE", loops_file)
+    # Isolate the lease + per-session notes so status is deterministic.
+    monkeypatch.setattr("looper.lease.LEASE_FILE", tmp_path / "owner.json")
+    monkeypatch.setattr("looper.lease.LOCK_FILE", tmp_path / "owner.lock")
+    monkeypatch.setattr("looper.harvest.SESSIONS_DIR", tmp_path / "sessions")
     return tmp_path, loops_file
 
 
@@ -94,57 +93,68 @@ class TestList:
         assert "daily-report" in result.output
         assert "cleanup" in result.output
 
-    def test_with_orphan_jobs(self, runner: CliRunner, isolated_env) -> None:
-        """Jobs without matching loops appear as orphans."""
-        tmp_path, _ = isolated_env
-        _seed_jobs(tmp_path, [
-            {
-                "id": "orphan-abc",
-                "name": "stray-task",
-                "interval": "5m",
-                "prompt": "I have no loop.",
-                "createdAt": "2099-01-01T00:00:00Z",
-            }
-        ])
-
-        result = runner.invoke(main, ["list"])
-        assert result.exit_code == 0
-        assert "orphan" in result.output.lower()
-        assert "stray-task" in result.output
-
-    def test_mixed_states(self, runner: CliRunner, isolated_env) -> None:
-        """Active, paused, and missing loops all render."""
-        tmp_path, loops_file = isolated_env
-        _seed_loops(loops_file)
-        # Provide a job only for check-deploys; daily-report is paused;
-        # cleanup has no matching job so it's "missing".
-        _seed_jobs(tmp_path, [
-            {
-                "id": "job-check-deploys",
-                "name": "loop: check-deploys",
-                "interval": "30m",
-                "prompt": "Check...",
-                "createdAt": "2099-01-01T00:00:00Z",
-            }
-        ])
-
-        result = runner.invoke(main, ["list"])
-        assert result.exit_code == 0
-        assert "check-deploys" in result.output
-        assert "daily-report" in result.output
-        assert "cleanup" in result.output
-        # Sync needed because cleanup is missing.
-        assert "sync" in result.output.lower() or "start-loops" in result.output
-
-    def test_shows_active_and_paused_labels(self, runner: CliRunner, isolated_env) -> None:
-        """List output distinguishes active vs paused loops."""
+    def test_does_not_claim_missing_or_out_of_sync(self, runner: CliRunner, isolated_env) -> None:
+        """list shows declared state only; it must not invent live-job status."""
         _, loops_file = isolated_env
         _seed_loops(loops_file)
 
         result = runner.invoke(main, ["list"])
         assert result.exit_code == 0
-        # "paused" state should appear for daily-report.
+        assert "missing" not in result.output.lower()
+        assert "out of sync" not in result.output.lower()
+
+    def test_points_to_start_loops(self, runner: CliRunner, isolated_env) -> None:
+        """list hints how to arm loops in a session."""
+        _, loops_file = isolated_env
+        _seed_loops(loops_file)
+
+        result = runner.invoke(main, ["list"])
+        assert "/start-loops" in result.output
+
+    def test_shows_idle_and_paused_labels(self, runner: CliRunner, isolated_env) -> None:
+        """With no live owner, enabled loops show 'idle'; disabled show 'paused'."""
+        _, loops_file = isolated_env
+        _seed_loops(loops_file)
+
+        result = runner.invoke(main, ["list"])
+        assert result.exit_code == 0
+        # No owner lease in the test → enabled loops are idle; daily-report paused.
+        assert "idle" in result.output.lower()
         assert "paused" in result.output.lower()
+
+    def test_running_when_session_hosts_it(self, runner: CliRunner, isolated_env) -> None:
+        """A loop shows 'running' when a live session's note reports hosting it."""
+        import os
+        from looper.harvest import save_state
+
+        tmp_path, loops_file = isolated_env
+        _seed_loops(loops_file)
+        # A live session (this process) reports hosting check-deploys.
+        save_state("sess1", {"cid": "check-deploys"}, pid=os.getpid(), cwd="/x")
+
+        result = runner.invoke(main, ["list"])
+        assert result.exit_code == 0
+        assert "running" in result.output.lower()
+
+
+class TestSyncArmFollowerMessage:
+    def test_arm_names_the_holding_session(self, runner: CliRunner, isolated_env) -> None:
+        """sync --arm, when another live session holds the lease, names it."""
+        import os
+        from looper import lease as lease_mod
+
+        tmp_path, loops_file = isolated_env
+        _seed_loops(loops_file)
+        # A different live session owns it, hosted at a known cwd.
+        lease_mod.claim_or_refresh(
+            "other-sess", os.getppid(), cwd="/work/demo-session"
+        )
+
+        # This invocation is a different session id + different pid -> follower.
+        result = runner.invoke(main, ["sync", "--arm", "--session-id", "me", "--pid", str(os.getpid())])
+        assert result.exit_code == 0
+        assert "/work/demo-session" in result.output
+        assert "/stop-loops" in result.output
 
 
 # ===========================================================================
@@ -446,150 +456,6 @@ class TestRetrigger:
 
 
 # ===========================================================================
-# 7. looper check
-# ===========================================================================
-
-
-class TestCheck:
-    def test_check_empty(self, runner: CliRunner, isolated_env) -> None:
-        """Check with no loops prints 'no loops registered'."""
-        result = runner.invoke(main, ["check"])
-        assert result.exit_code == 0
-        assert "no loops" in result.output.lower()
-
-    def test_check_with_sync_needed(self, runner: CliRunner, isolated_env) -> None:
-        """Check with active loops but no jobs flags sync needed."""
-        _, loops_file = isolated_env
-        _seed_loops(loops_file)
-
-        result = runner.invoke(main, ["check"])
-        assert result.exit_code == 0
-        assert "missing" in result.output.lower()
-        assert "sync" in result.output.lower() or "start-loops" in result.output
-
-    def test_check_all_current(self, runner: CliRunner, isolated_env) -> None:
-        """Check with all loops matched by fresh jobs shows active, no sync needed."""
-        tmp_path, loops_file = isolated_env
-        loops_file.write_text(
-            "## my-loop\ninterval: 10m\nactive: true\n\nDo something.\n",
-            encoding="utf-8",
-        )
-        _seed_jobs(tmp_path, [
-            {
-                "id": "job-1",
-                "name": "loop: my-loop",
-                "interval": "10m",
-                "prompt": "Do something.",
-                "createdAt": "2099-01-01T00:00:00Z",
-            }
-        ])
-
-        result = runner.invoke(main, ["check"])
-        assert result.exit_code == 0
-        assert "active" in result.output.lower()
-        assert "sync needed" not in result.output.lower()
-
-    def test_check_with_project_dir(self, runner: CliRunner, isolated_env) -> None:
-        """Check with --project-dir creates a symlink and reports."""
-        tmp_path, _ = isolated_env
-        project = tmp_path / "my-project"
-        project.mkdir()
-
-        result = runner.invoke(main, ["check", "--project-dir", str(project)])
-        assert result.exit_code == 0
-
-        link = project / ".claude" / "scheduled_tasks.json"
-        assert link.is_symlink()
-
-    def test_check_with_orphan_jobs(self, runner: CliRunner, isolated_env) -> None:
-        """Check detects orphan jobs (in cron but not in loops.md)."""
-        tmp_path, _ = isolated_env
-        _seed_jobs(tmp_path, [
-            {
-                "id": "orphan-123",
-                "name": "stale-cron-job",
-                "interval": "5m",
-                "prompt": "Orphaned.",
-                "createdAt": "2099-01-01T00:00:00Z",
-            }
-        ])
-
-        result = runner.invoke(main, ["check"])
-        assert result.exit_code == 0
-        assert "orphan" in result.output.lower()
-        assert "stale-cron-job" in result.output
-
-    def test_check_shows_paused_count(self, runner: CliRunner, isolated_env) -> None:
-        """Check reports paused loops in the summary."""
-        _, loops_file = isolated_env
-        _seed_loops(loops_file)
-
-        result = runner.invoke(main, ["check"])
-        assert result.exit_code == 0
-        assert "paused" in result.output.lower()
-
-    def test_check_shows_per_loop_detail(self, runner: CliRunner, isolated_env) -> None:
-        """Check output includes the name of each loop."""
-        _, loops_file = isolated_env
-        _seed_loops(loops_file)
-
-        result = runner.invoke(main, ["check"])
-        assert result.exit_code == 0
-        assert "check-deploys" in result.output
-        assert "daily-report" in result.output
-        assert "cleanup" in result.output
-
-
-# ===========================================================================
-# 8. looper link
-# ===========================================================================
-
-
-class TestLink:
-    def test_link_creates_symlink(self, runner: CliRunner, isolated_env) -> None:
-        """Link creates a symlink from the project dir to the canonical file."""
-        tmp_path, _ = isolated_env
-        project = tmp_path / "my-project"
-        project.mkdir()
-
-        result = runner.invoke(main, ["link", str(project)])
-        assert result.exit_code == 0
-        assert "Linked" in result.output or "symlink" in result.output.lower()
-
-        link = project / ".claude" / "scheduled_tasks.json"
-        assert link.is_symlink()
-
-    def test_link_idempotent(self, runner: CliRunner, isolated_env) -> None:
-        """Linking twice does not fail."""
-        tmp_path, _ = isolated_env
-        project = tmp_path / "my-project"
-        project.mkdir()
-
-        result1 = runner.invoke(main, ["link", str(project)])
-        assert result1.exit_code == 0
-
-        result2 = runner.invoke(main, ["link", str(project)])
-        assert result2.exit_code == 0
-
-    def test_link_default_cwd(self, runner: CliRunner, isolated_env) -> None:
-        """Link with no argument uses current directory (default='.')."""
-        tmp_path, _ = isolated_env
-
-        with runner.isolated_filesystem(temp_dir=tmp_path) as td:
-            result = runner.invoke(main, ["link"])
-            assert result.exit_code == 0
-
-            link = Path(td) / ".claude" / "scheduled_tasks.json"
-            assert link.is_symlink()
-
-    def test_link_nonexistent_dir_fails(self, runner: CliRunner, isolated_env) -> None:
-        """Link to a nonexistent directory fails."""
-        tmp_path, _ = isolated_env
-        result = runner.invoke(main, ["link", str(tmp_path / "does-not-exist")])
-        assert result.exit_code != 0
-
-
-# ===========================================================================
 # 9. --version
 # ===========================================================================
 
@@ -625,12 +491,12 @@ class TestHelp:
         """--help shows available subcommands."""
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ["list", "add", "pause", "resume", "delete", "retrigger", "check", "link"]:
+        for cmd in ["list", "add", "pause", "resume", "delete", "retrigger", "sync", "release"]:
             assert cmd in result.output, f"Command '{cmd}' not listed in help"
 
     def test_subcommand_help(self, runner: CliRunner) -> None:
         """Each subcommand supports --help."""
-        for cmd in ["list", "add", "pause", "resume", "delete", "retrigger", "check", "link"]:
+        for cmd in ["list", "add", "pause", "resume", "delete", "retrigger", "sync", "release"]:
             result = runner.invoke(main, [cmd, "--help"])
             assert result.exit_code == 0, f"{cmd} --help failed"
             assert "Usage" in result.output or "usage" in result.output, (
@@ -697,13 +563,13 @@ class TestLifecycle:
         assert "loop-b" in result.output
         assert "loop-c" in result.output
 
-    def test_add_then_check_shows_missing(self, runner: CliRunner, isolated_env) -> None:
-        """A newly added loop with no matching job shows as missing in check."""
+    def test_add_then_list_shows_idle(self, runner: CliRunner, isolated_env) -> None:
+        """A newly added loop with no hosting session shows as idle in list."""
         runner.invoke(main, ["add", "new-loop", "10m", "-p", "New."])
 
-        result = runner.invoke(main, ["check"])
+        result = runner.invoke(main, ["list"])
         assert result.exit_code == 0
-        assert "missing" in result.output.lower()
+        assert "idle" in result.output.lower()
         assert "new-loop" in result.output
 
     def test_delete_middle_preserves_others(self, runner: CliRunner, isolated_env) -> None:

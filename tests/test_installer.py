@@ -8,9 +8,8 @@ from pathlib import Path
 import pytest
 
 from looper.installer import (
-    HOOK_COMMAND,
+    LOOPER_HOOKS,
     LOOPS_MD_HEADER,
-    SESSION_HOOK,
     START_LOOPS_CONTENT,
     install,
     install_start_loops_command,
@@ -32,16 +31,20 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     claude_dir = tmp_path / ".claude"
     settings = claude_dir / "settings.json"
     commands_dir = claude_dir / "commands"
-    canonical = looper_home / ".claude" / "scheduled_tasks.json"
     loops_file = looper_home / "loops.md"
 
     monkeypatch.setattr("looper.installer.LOOPER_HOME", looper_home)
     monkeypatch.setattr("looper.installer.LOOPS_FILE", loops_file)
-    monkeypatch.setattr("looper.installer.CANONICAL_TASKS", canonical)
     monkeypatch.setattr("looper.installer.CLAUDE_SETTINGS", settings)
     monkeypatch.setattr("looper.installer.CLAUDE_COMMANDS_DIR", commands_dir)
     monkeypatch.setattr(
         "looper.installer.START_LOOPS_COMMAND", commands_dir / "start-loops.md"
+    )
+    monkeypatch.setattr(
+        "looper.installer.DELETE_LOOP_COMMAND", commands_dir / "delete-loop.md"
+    )
+    monkeypatch.setattr(
+        "looper.installer.STOP_LOOPS_COMMAND", commands_dir / "stop-loops.md"
     )
 
     return tmp_path, looper_home, settings, commands_dir
@@ -54,7 +57,7 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 class TestSetupLooperHome:
     def test_creates_directory_structure(self, isolated_env) -> None:
-        """setup_looper_home creates ~/looper/, loops.md, and scheduled_tasks.json."""
+        """setup_looper_home creates ~/.looper/ and an initial loops.md."""
         _, looper_home, _, _ = isolated_env
 
         setup_looper_home()
@@ -64,31 +67,19 @@ class TestSetupLooperHome:
         assert loops_file.exists()
         assert loops_file.read_text() == LOOPS_MD_HEADER
 
-        canonical = looper_home / ".claude" / "scheduled_tasks.json"
-        assert canonical.exists()
-        assert json.loads(canonical.read_text()) == []
-
     def test_idempotent_preserves_existing_loops(self, isolated_env) -> None:
         """Running twice doesn't overwrite an existing loops.md."""
         _, looper_home, _, _ = isolated_env
 
         setup_looper_home()
 
-        # Write custom content to loops.md
         loops_file = looper_home / "loops.md"
         custom_content = "## my-loop\ninterval: 5m\nactive: true\n\nDo stuff.\n"
         loops_file.write_text(custom_content)
 
-        # Also write custom scheduled_tasks.json
-        canonical = looper_home / ".claude" / "scheduled_tasks.json"
-        canonical.write_text('[{"name": "existing"}]')
-
-        # Run again
         setup_looper_home()
 
-        # Both files should be untouched
         assert loops_file.read_text() == custom_content
-        assert canonical.read_text() == '[{"name": "existing"}]'
 
 
 # ---------------------------------------------------------------------------
@@ -96,41 +87,61 @@ class TestSetupLooperHome:
 # ---------------------------------------------------------------------------
 
 
+def _commands_for(settings_data: dict, event: str) -> list[str]:
+    return [
+        h.get("command")
+        for entry in settings_data.get("hooks", {}).get(event, [])
+        for h in entry.get("hooks", [])
+    ]
+
+
 class TestRegisterSessionHook:
-    def test_creates_settings_with_hook(self, isolated_env) -> None:
-        """Adds hook to a freshly created settings.json."""
+    def test_creates_all_three_hooks(self, isolated_env) -> None:
+        """Registers SessionStart, Stop, and SessionEnd."""
         _, _, settings, _ = isolated_env
 
         register_session_hook()
 
-        assert settings.exists()
         data = json.loads(settings.read_text())
-        assert "hooks" in data
-        assert len(data["hooks"]) == 1
-        assert data["hooks"][0] == SESSION_HOOK
+        assert "looper sync" in _commands_for(data, "SessionStart")
+        assert "looper sync" in _commands_for(data, "Stop")
+        assert "looper release" in _commands_for(data, "SessionEnd")
 
-    def test_idempotent_no_duplicate_hooks(self, isolated_env) -> None:
-        """Calling twice doesn't add the hook a second time."""
+    def test_hook_entries_have_matcher_and_nested_hooks(self, isolated_env) -> None:
+        """Each entry is a matcher + nested hooks array (Claude Code's required shape)."""
+        _, _, settings, _ = isolated_env
+
+        register_session_hook()
+        data = json.loads(settings.read_text())
+        entry = data["hooks"]["SessionStart"][0]
+        assert entry["matcher"] == ""
+        assert entry["hooks"][0]["type"] == "command"
+        assert entry["hooks"][0]["command"] == "looper sync"
+
+    def test_idempotent_no_duplicates(self, isolated_env) -> None:
+        """Calling twice doesn't duplicate any hook."""
         _, _, settings, _ = isolated_env
 
         register_session_hook()
         register_session_hook()
 
         data = json.loads(settings.read_text())
-        matching = [h for h in data["hooks"] if h.get("command") == HOOK_COMMAND]
-        assert len(matching) == 1
+        for event in LOOPER_HOOKS:
+            cmds = _commands_for(data, event)
+            assert cmds.count(LOOPER_HOOKS[event]) == 1
 
     def test_preserves_existing_settings(self, isolated_env) -> None:
         """Other keys and hooks in settings.json are preserved."""
         _, _, settings, _ = isolated_env
 
-        # Pre-populate settings with other content
         settings.parent.mkdir(parents=True, exist_ok=True)
         existing = {
             "theme": "dark",
-            "hooks": [
-                {"type": "command", "event": "SessionStart", "command": "other-tool check"}
-            ],
+            "hooks": {
+                "SessionStart": [
+                    {"matcher": "", "hooks": [{"type": "command", "command": "other-tool check"}]},
+                ],
+            },
             "permissions": {"allow": ["bash"]},
         }
         settings.write_text(json.dumps(existing, indent=2) + "\n")
@@ -138,17 +149,14 @@ class TestRegisterSessionHook:
         register_session_hook()
 
         data = json.loads(settings.read_text())
-        # Existing settings preserved
         assert data["theme"] == "dark"
         assert data["permissions"] == {"allow": ["bash"]}
-        # Both hooks present
-        assert len(data["hooks"]) == 2
-        commands = [h["command"] for h in data["hooks"]]
-        assert "other-tool check" in commands
-        assert HOOK_COMMAND in commands
+        start_cmds = _commands_for(data, "SessionStart")
+        assert "other-tool check" in start_cmds
+        assert "looper sync" in start_cmds
 
     def test_corrupt_settings_backed_up(self, isolated_env) -> None:
-        """Corrupt settings.json is backed up and hook is written fresh."""
+        """Corrupt settings.json is backed up and hooks written fresh."""
         _, _, settings, _ = isolated_env
 
         settings.parent.mkdir(parents=True, exist_ok=True)
@@ -156,15 +164,12 @@ class TestRegisterSessionHook:
 
         register_session_hook()
 
-        # Backup created
         backup = settings.with_suffix(".json.bak")
         assert backup.exists()
         assert backup.read_text() == "this is not valid JSON {{{"
 
-        # Fresh settings with hook
         data = json.loads(settings.read_text())
-        assert len(data["hooks"]) == 1
-        assert data["hooks"][0] == SESSION_HOOK
+        assert "looper sync" in _commands_for(data, "SessionStart")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +208,26 @@ class TestInstallStartLoopsCommand:
 
         assert cmd_file.read_text() == START_LOOPS_CONTENT
 
+    def test_writes_delete_loop_command(self, isolated_env) -> None:
+        """Creates delete-loop.md alongside start-loops.md."""
+        _, _, _, commands_dir = isolated_env
+
+        install_start_loops_command()
+
+        delete_cmd = commands_dir / "delete-loop.md"
+        assert delete_cmd.exists()
+        assert "looper delete" in delete_cmd.read_text()
+
+    def test_writes_close_loops_command(self, isolated_env) -> None:
+        """Creates stop-loops.md (release the lease / hand off)."""
+        _, _, _, commands_dir = isolated_env
+
+        install_start_loops_command()
+
+        close_cmd = commands_dir / "stop-loops.md"
+        assert close_cmd.exists()
+        assert "looper release" in close_cmd.read_text()
+
 
 # ---------------------------------------------------------------------------
 # 4. install (full)
@@ -219,12 +244,13 @@ class TestInstall:
         # Step 1: home dir
         assert looper_home.is_dir()
         assert (looper_home / "loops.md").exists()
-        assert (looper_home / ".claude" / "scheduled_tasks.json").exists()
 
-        # Step 2: session hook
+        # Step 2: hooks registered
         assert settings.exists()
         data = json.loads(settings.read_text())
-        assert any(h.get("command") == HOOK_COMMAND for h in data.get("hooks", []))
+        assert "looper sync" in _commands_for(data, "SessionStart")
+        assert "looper sync" in _commands_for(data, "Stop")
+        assert "looper release" in _commands_for(data, "SessionEnd")
 
         # Step 3: start-loops command
         assert (commands_dir / "start-loops.md").exists()
@@ -245,17 +271,21 @@ class TestUninstall:
 
         # Verify everything is in place
         assert (commands_dir / "start-loops.md").exists()
+        assert (commands_dir / "delete-loop.md").exists()
+        assert (commands_dir / "stop-loops.md").exists()
 
         # Uninstall
         uninstall()
 
-        # Hook removed from settings
         data = json.loads(settings.read_text())
-        matching = [h for h in data.get("hooks", []) if h.get("command") == HOOK_COMMAND]
-        assert len(matching) == 0
+        assert "looper sync" not in _commands_for(data, "SessionStart")
+        assert "looper sync" not in _commands_for(data, "Stop")
+        assert "looper release" not in _commands_for(data, "SessionEnd")
 
-        # Command file removed
+        # Command files removed
         assert not (commands_dir / "start-loops.md").exists()
+        assert not (commands_dir / "delete-loop.md").exists()
+        assert not (commands_dir / "stop-loops.md").exists()
 
         # looper home preserved
         assert looper_home.is_dir()
@@ -268,21 +298,19 @@ class TestUninstall:
         # Install looper
         install()
 
-        # Add another hook manually
         data = json.loads(settings.read_text())
-        other_hook = {
-            "type": "command",
-            "event": "SessionStart",
-            "command": "some-other-tool run",
+        other_entry = {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": "some-other-tool run"}],
         }
-        data["hooks"].append(other_hook)
+        data["hooks"]["SessionStart"].append(other_entry)
         settings.write_text(json.dumps(data, indent=2) + "\n")
 
         uninstall()
 
         data = json.loads(settings.read_text())
-        assert len(data["hooks"]) == 1
-        assert data["hooks"][0]["command"] == "some-other-tool run"
+        start_cmds = _commands_for(data, "SessionStart")
+        assert start_cmds == ["some-other-tool run"]
 
     def test_noop_when_nothing_installed(self, isolated_env) -> None:
         """uninstall doesn't error when nothing is installed."""
@@ -306,7 +334,7 @@ class TestUninstall:
 
         data = json.loads(settings.read_text())
         assert data["theme"] == "dark"
-        assert data.get("hooks", []) == []
+        assert data.get("hooks", {}) == {} or data.get("hooks") == {}
 
     def test_handles_corrupt_settings(self, isolated_env) -> None:
         """uninstall handles corrupt settings.json without crashing."""

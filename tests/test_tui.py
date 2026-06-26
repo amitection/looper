@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import DataTable, Static
 
-from looper.models import CheckResult, Loop, LoopStatus
+from looper.models import Loop, LoopStatus
 
 
 # ---------------------------------------------------------------------------
@@ -46,15 +46,11 @@ Clean up old temporary files.
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Redirect all looper paths to tmp_path so tests never touch real user dirs."""
     loops_file = tmp_path / "loops.md"
-    canonical = tmp_path / ".claude" / "scheduled_tasks.json"
-    canonical.parent.mkdir(parents=True, exist_ok=True)
-    canonical.write_text("[]")
 
     monkeypatch.setattr("looper.LOOPER_HOME", tmp_path)
     monkeypatch.setattr("looper.LOOPS_FILE", loops_file)
-    monkeypatch.setattr("looper.CANONICAL_TASKS", canonical)
     monkeypatch.setattr("looper.registry.LOOPS_FILE", loops_file)
-    monkeypatch.setattr("looper.registry.CANONICAL_TASKS", canonical)
+    monkeypatch.setattr("looper.harvest.SESSIONS_DIR", tmp_path / "sessions")
     return tmp_path, loops_file
 
 
@@ -135,7 +131,7 @@ async def test_table_row_names(populated_env):
         assert names == {"check-deploys", "daily-report", "cleanup"}
 
 
-async def test_table_row_active_column(populated_env):
+async def test_table_row_status_column(populated_env):
     app = _make_app()
     async with app.run_test() as pilot:
         table = app.query_one("#loops-table", DataTable)
@@ -143,10 +139,11 @@ async def test_table_row_active_column(populated_env):
         for i in range(table.row_count):
             row = table.get_row_at(i)
             rows[str(row[0])] = row
-        # Column index 3 is Active ("yes"/"no").
-        assert str(rows["check-deploys"][3]) == "yes"
-        assert str(rows["daily-report"][3]) == "no"
-        assert str(rows["cleanup"][3]) == "yes"
+        # Columns: Name, Schedule, Status. No live session note in the test, so
+        # enabled loops are "idle"; daily-report is paused.
+        assert str(rows["check-deploys"][2]) == "idle"
+        assert str(rows["daily-report"][2]) == "paused"
+        assert str(rows["cleanup"][2]) == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +215,10 @@ async def test_press_t_toggles_loop_active_state(populated_env):
         table = app.query_one("#loops-table", DataTable)
         assert table.row_count == 3
 
-        # Identify the first row to know its initial active state.
+        # Identify the first row to know its initial status.
         row0_before = table.get_row_at(0)
         first_name = str(row0_before[0])
-        initial_active = str(row0_before[3])
+        initial_status = str(row0_before[2])
 
         # Press 't' to toggle.
         await pilot.press("t")
@@ -230,10 +227,10 @@ async def test_press_t_toggles_loop_active_state(populated_env):
         # Verify on disk that the toggle persisted.
         loops = parse_loops(loops_file)
         toggled = next(lp for lp in loops if lp.name == first_name)
-        if initial_active == "yes":
-            assert toggled.active is False
-        else:
+        if initial_status == "paused":
             assert toggled.active is True
+        else:
+            assert toggled.active is False
 
 
 async def test_press_t_updates_table(populated_env):
@@ -241,17 +238,18 @@ async def test_press_t_updates_table(populated_env):
     async with app.run_test() as pilot:
         table = app.query_one("#loops-table", DataTable)
         row0_before = table.get_row_at(0)
-        initial_active = str(row0_before[3])
+        initial_status = str(row0_before[2])
 
         await pilot.press("t")
         await pilot.pause()
 
-        # After toggle and refresh the active column should flip.
+        # After toggle and refresh the status column should flip (idle <-> paused
+        # in the test, since no live session is hosting).
         table = app.query_one("#loops-table", DataTable)
         row0_after = table.get_row_at(0)
-        new_active = str(row0_after[3])
-        expected = "no" if initial_active == "yes" else "yes"
-        assert new_active == expected
+        new_status = str(row0_after[2])
+        expected = "idle" if initial_status == "paused" else "paused"
+        assert new_status == expected
 
 
 # ---------------------------------------------------------------------------
@@ -348,30 +346,17 @@ async def test_prompt_view_escape_closes(populated_env):
 
 
 # ---------------------------------------------------------------------------
-# 10. Pressing 'c' opens CheckResultScreen
+# 10. Pressing 'g' refreshes
 # ---------------------------------------------------------------------------
 
 
-async def test_press_c_opens_check_result(populated_env):
-    from looper.tui import CheckResultScreen
+async def test_press_g_refreshes(populated_env):
     app = _make_app()
     async with app.run_test() as pilot:
-        await pilot.press("c")
+        await pilot.press("g")
         await pilot.pause()
-        assert isinstance(app.screen, CheckResultScreen)
-
-
-async def test_check_result_escape_closes(populated_env):
-    from looper.tui import CheckResultScreen
-    app = _make_app()
-    async with app.run_test() as pilot:
-        await pilot.press("c")
-        await pilot.pause()
-        assert isinstance(app.screen, CheckResultScreen)
-
-        await pilot.press("escape")
-        await pilot.pause()
-        assert not isinstance(app.screen, CheckResultScreen)
+        # Table is still populated after a refresh.
+        assert app.query_one("#loops-table", DataTable).row_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -380,22 +365,21 @@ async def test_check_result_escape_closes(populated_env):
 
 
 async def test_status_bar_shows_loop_counts(populated_env):
-    """Status bar should display total and active loop counts."""
+    """Status bar should display total and running loop counts."""
     app = _make_app()
     async with app.run_test() as pilot:
         bar = app.query_one("#status-bar", Static)
-        # Static.content returns the renderable set via update().
         text = str(bar.content)
-        # 3 total loops, 2 active (check-deploys and cleanup; daily-report is paused).
+        # 3 total loops; none running (no live session note in the test).
         assert "Loops: 3" in text
-        assert "Active: 2" in text
+        assert "Running: 0" in text
 
 
 async def test_detail_panel_updates_on_mount(populated_env):
     """On mount with loops, the detail panel should show info about the first loop."""
     app = _make_app()
     async with app.run_test() as pilot:
-        title = app.query_one("#detail-title", Static)
+        title = app.query_one("#detail-name", Static)
         body = app.query_one("#detail-body", Static)
 
         title_text = str(title.content)
@@ -417,15 +401,3 @@ async def test_no_loop_selected_actions_do_not_crash(isolated_env):
         # Reaching here without exception means no crashes.
 
 
-async def test_check_result_close_button(populated_env):
-    """Clicking the Close button on CheckResultScreen should dismiss it."""
-    from looper.tui import CheckResultScreen
-    app = _make_app()
-    async with app.run_test() as pilot:
-        await pilot.press("c")
-        await pilot.pause()
-        assert isinstance(app.screen, CheckResultScreen)
-
-        await pilot.click("#check-close")
-        await pilot.pause()
-        assert not isinstance(app.screen, CheckResultScreen)

@@ -15,7 +15,6 @@ from pathlib import Path
 from rich.console import Console
 
 from looper import (
-    CANONICAL_TASKS,
     CLAUDE_COMMANDS_DIR,
     CLAUDE_SETTINGS,
     LOOPER_HOME,
@@ -24,14 +23,23 @@ from looper import (
 
 console = Console()
 
-HOOK_COMMAND = "looper check"
-SESSION_HOOK = {
-    "type": "command",
-    "event": "SessionStart",
-    "command": HOOK_COMMAND,
+# Map of hook event -> the looper command it runs.
+# SessionStart + Stop both run `looper sync` (claim/refresh the owner lease so
+# only one session ever registers loops). SessionEnd releases the lease.
+LOOPER_HOOKS = {
+    "SessionStart": "looper sync",
+    "Stop": "looper sync",
+    "SessionEnd": "looper release",
 }
+LOOPER_HOOK_COMMANDS = set(LOOPER_HOOKS.values())
+
+
+def _entry(command: str) -> dict:
+    return {"matcher": "", "hooks": [{"type": "command", "command": command}]}
 
 START_LOOPS_COMMAND = CLAUDE_COMMANDS_DIR / "start-loops.md"
+DELETE_LOOP_COMMAND = CLAUDE_COMMANDS_DIR / "delete-loop.md"
+STOP_LOOPS_COMMAND = CLAUDE_COMMANDS_DIR / "stop-loops.md"
 
 LOOPS_MD_HEADER = """\
 # looper loops
@@ -55,21 +63,71 @@ LOOPS_MD_HEADER = """\
 """
 
 START_LOOPS_CONTENT = """\
-Reconcile all active loops from the looper registry.
+Arm looper's durable loops for THIS session, without creating duplicates across
+concurrent sessions.
 
 Steps:
-1. Read ~/.looper/loops.md to get all loop definitions.
-2. Check existing scheduled tasks (CronList) to see what's already registered.
-3. For each active loop in loops.md:
-   - If a matching job already exists (same name/prompt), skip it.
-   - If no matching job exists, use CronCreate to register it with the loop's interval and prompt. This resets the 7-day expiry clock.
-4. Report a summary of what was synced:
-   - How many loops were already registered (skipped)
-   - How many loops were newly registered
-   - How many loops are paused (not synced)
-   - Any errors encountered
+1. Run `looper sync --arm` with the Bash tool. It coordinates a single-owner
+   lease so that only one live session registers the loops.
 
-Use the loop name as the CronCreate name/label for deduplication.
+2. Read looper sync's output:
+   - If it prints nothing (or says you are not the owner): another live session
+     already owns the loops. Do NOT register anything. Tell the user the loops
+     are already active in another session, and stop.
+   - If it prints "[looper] You are now the loop owner" followed by a list of
+     loops (each line `- <name> (<schedule>): <prompt>`): you are the owner —
+     continue to step 3.
+
+3. Run CronList to see what is already registered in THIS session.
+
+4. For each loop in looper sync's list:
+   - If a matching job already exists in CronList (same schedule + prompt), skip it.
+   - Otherwise call CronCreate with recurring=true, using the loop's schedule and
+     prompt. (This resets the 7-day expiry clock.)
+
+5. Report a short summary: which loops were newly registered, which were already
+   present, and any errors.
+
+If `looper sync` fails because looper is not installed, tell the user to run
+`looper install` first.
+"""
+
+DELETE_LOOP_CONTENT = """\
+Delete a looper loop — remove it from the registry and stop it firing now.
+
+Usage: /delete-loop <name>   (if no name is given, list loops and ask which)
+
+Steps:
+1. If no loop name was given in the command, run `looper list` with the Bash
+   tool, show the user their loops, and ask which to delete. Wait for an answer.
+
+2. Run `looper delete <name> --force` with Bash. This removes the loop from
+   ~/.looper/loops.md so it won't be re-armed by /start-loops again.
+
+3. Run CronList. If a live job in THIS session matches that loop (same prompt /
+   schedule), call CronDelete on it so it stops firing immediately. (Jobs in
+   other sessions will stop on their own once those sessions end.)
+
+4. Confirm: removed from the registry, and whether a live job was also cancelled.
+
+If `looper delete` says the loop doesn't exist, tell the user and stop.
+"""
+
+STOP_LOOPS_CONTENT = """\
+Stop hosting looper's loops in THIS session and release the lease, so another
+session can take over. (Use this to hand control to a different session — you do
+NOT need it if you're just closing this session, which releases automatically.)
+
+Steps:
+1. Run `looper list` with the Bash tool to see the loops looper manages.
+2. Run CronList. For each live job in THIS session that matches a looper loop
+   (same prompt / schedule), call CronDelete so it stops firing here.
+3. Run `looper release` with Bash to drop the ownership lease.
+4. Report: which loops were stopped, and that the lease is released. Tell the
+   user they can now run /start-loops in another session to resume them.
+
+If `looper release` indicates nothing was held here, just report that this
+session wasn't hosting the loops.
 """
 
 
@@ -78,29 +136,18 @@ def setup_looper_home() -> None:
     LOOPER_HOME.mkdir(parents=True, exist_ok=True)
     console.print(f"  [green]+[/] {LOOPER_HOME}/")
 
-    claude_dir = CANONICAL_TASKS.parent
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    console.print(f"  [green]+[/] {claude_dir}/")
-
     if not LOOPS_FILE.exists():
         LOOPS_FILE.write_text(LOOPS_MD_HEADER)
         console.print(f"  [green]+[/] {LOOPS_FILE} (initialized)")
     else:
         console.print(f"  [dim]-[/] {LOOPS_FILE} (already exists)")
 
-    if not CANONICAL_TASKS.exists():
-        CANONICAL_TASKS.write_text("[]")
-        console.print(f"  [green]+[/] {CANONICAL_TASKS} (initialized)")
-    else:
-        console.print(f"  [dim]-[/] {CANONICAL_TASKS} (already exists)")
-
 
 def register_session_hook() -> None:
-    """Add a SessionStart hook to ~/.claude/settings.json.
+    """Register the SessionStart/Stop/SessionEnd hooks in ~/.claude/settings.json.
 
-    Reads the existing settings, appends the hook to the hooks array
-    (creating it if absent), and writes back. Skips if the hook is
-    already registered (matched by command string).
+    Reads existing settings, adds any missing looper hooks (preserving every
+    other hook), and writes back. Idempotent — re-running adds nothing new.
     """
     settings_dir = CLAUDE_SETTINGS.parent
     settings_dir.mkdir(parents=True, exist_ok=True)
@@ -112,34 +159,45 @@ def register_session_hook() -> None:
             # Corrupted settings file -- back up and start fresh
             backup = CLAUDE_SETTINGS.with_suffix(".json.bak")
             CLAUDE_SETTINGS.rename(backup)
-            console.print(
-                f"  [yellow]![/] Backed up corrupt settings to {backup}"
-            )
+            console.print(f"  [yellow]![/] Backed up corrupt settings to {backup}")
             settings = {}
     else:
         settings = {}
 
-    hooks = settings.get("hooks", [])
+    hooks = settings.get("hooks", {})
+    if isinstance(hooks, list):
+        hooks = {}
 
-    # Check if already registered
-    for hook in hooks:
-        if hook.get("command") == HOOK_COMMAND:
-            console.print("  [dim]-[/] SessionStart hook (already registered)")
-            return
+    for event, command in LOOPER_HOOKS.items():
+        entries = hooks.get(event, [])
+        already = any(
+            h.get("command") == command
+            for entry in entries
+            for h in entry.get("hooks", [])
+        )
+        if already:
+            console.print(f"  [dim]-[/] {event} hook (already registered)")
+            continue
+        entries.append(_entry(command))
+        hooks[event] = entries
+        console.print(f"  [green]+[/] {event} -> {command}")
 
-    hooks.append(SESSION_HOOK)
     settings["hooks"] = hooks
-
     CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    console.print("  [green]+[/] SessionStart hook registered in settings.json")
 
 
 def install_start_loops_command() -> None:
-    """Write the /start-loops custom command to ~/.claude/commands/."""
+    """Write looper's custom commands (/start-loops, /delete-loop) to ~/.claude/commands/."""
     CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
 
     START_LOOPS_COMMAND.write_text(START_LOOPS_CONTENT)
     console.print(f"  [green]+[/] {START_LOOPS_COMMAND}")
+
+    DELETE_LOOP_COMMAND.write_text(DELETE_LOOP_CONTENT)
+    console.print(f"  [green]+[/] {DELETE_LOOP_COMMAND}")
+
+    STOP_LOOPS_COMMAND.write_text(STOP_LOOPS_CONTENT)
+    console.print(f"  [green]+[/] {STOP_LOOPS_COMMAND}")
 
 
 def install() -> None:
@@ -154,18 +212,19 @@ def install() -> None:
     console.print("[bold]1.[/] Setting up looper home directory")
     setup_looper_home()
 
-    console.print("\n[bold]2.[/] Registering SessionStart hook")
+    console.print("\n[bold]2.[/] Registering hooks (SessionStart / Stop / SessionEnd)")
     register_session_hook()
 
-    console.print("\n[bold]3.[/] Installing /start-loops command")
+    console.print("\n[bold]3.[/] Installing commands (/start-loops, /delete-loop, /stop-loops)")
     install_start_loops_command()
 
     console.print("\n[bold green]Done![/] looper is installed.\n")
     console.print("  Next steps:")
-    console.print("    1. Add loops:  [cyan]looper add <name> <interval>[/]")
-    console.print("    2. Sync now:   [cyan]/start-loops[/] in Claude Code")
+    console.print('    1. Open Claude and say: [cyan]"Using looper, schedule a loop to check deploys every 30m"[/]')
+    console.print("    2. Or use the CLI:      [cyan]looper add <name> <interval> --prompt '...'[/]")
+    console.print("    3. Or browse the TUI:   [cyan]looper tui[/]")
     console.print(
-        "    3. Auto-sync:  happens on every session start via hook\n"
+        "\n  Loops auto-sync on every Claude session start via hook.\n"
     )
 
 
@@ -178,34 +237,52 @@ def uninstall() -> None:
     """
     console.print("\n[bold]Uninstalling looper...[/]\n")
 
-    # Remove SessionStart hook
-    console.print("[bold]1.[/] Removing SessionStart hook")
+    # Remove looper hooks (SessionStart/Stop/SessionEnd), preserving others
+    console.print("[bold]1.[/] Removing looper hooks")
     if CLAUDE_SETTINGS.exists():
         try:
             settings = json.loads(CLAUDE_SETTINGS.read_text())
         except (json.JSONDecodeError, ValueError):
             settings = {}
 
-        hooks = settings.get("hooks", [])
-        original_count = len(hooks)
-        hooks = [h for h in hooks if h.get("command") != HOOK_COMMAND]
+        hooks = settings.get("hooks", {})
+        if isinstance(hooks, list):
+            hooks = {}
 
-        if len(hooks) < original_count:
-            settings["hooks"] = hooks
-            CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-            console.print("  [green]+[/] SessionStart hook removed")
-        else:
-            console.print("  [dim]-[/] SessionStart hook (not found)")
+        removed = False
+        for event in list(hooks.keys()):
+            entries = hooks.get(event, [])
+            kept = [
+                entry for entry in entries
+                if not any(
+                    h.get("command") in LOOPER_HOOK_COMMANDS
+                    for h in entry.get("hooks", [])
+                )
+            ]
+            if len(kept) < len(entries):
+                removed = True
+            if kept:
+                hooks[event] = kept
+            else:
+                hooks.pop(event, None)
+
+        settings["hooks"] = hooks
+        CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+        console.print(
+            "  [green]+[/] looper hooks removed" if removed
+            else "  [dim]-[/] looper hooks (not found)"
+        )
     else:
         console.print("  [dim]-[/] settings.json (not found)")
 
-    # Remove start-loops command
-    console.print("\n[bold]2.[/] Removing /start-loops command")
-    if START_LOOPS_COMMAND.exists():
-        START_LOOPS_COMMAND.unlink()
-        console.print(f"  [green]+[/] Removed {START_LOOPS_COMMAND}")
-    else:
-        console.print(f"  [dim]-[/] {START_LOOPS_COMMAND} (not found)")
+    # Remove custom commands
+    console.print("\n[bold]2.[/] Removing commands (/start-loops, /delete-loop, /stop-loops)")
+    for cmd in (START_LOOPS_COMMAND, DELETE_LOOP_COMMAND, STOP_LOOPS_COMMAND):
+        if cmd.exists():
+            cmd.unlink()
+            console.print(f"  [green]+[/] Removed {cmd}")
+        else:
+            console.print(f"  [dim]-[/] {cmd} (not found)")
 
     console.print("\n[bold green]Done![/] looper integration removed.\n")
     console.print(

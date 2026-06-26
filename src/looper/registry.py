@@ -1,22 +1,14 @@
-"""Core registry — parse, write, diff, and sync loops against live cron jobs."""
+"""Core registry — parse and edit loops.md (the durable loop registry)."""
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from looper import (
-    CANONICAL_TASKS,
-    EXPIRY_DAYS,
-    LOOPS_FILE,
-    RENEW_BEFORE_DAYS,
-    SHORTHAND_MULTIPLIERS,
-    SHORTHAND_PATTERN,
-)
-from looper.models import CheckResult, Job, Loop, LoopStatus
+from looper import LOOPS_FILE, SHORTHAND_MULTIPLIERS, SHORTHAND_PATTERN
+from looper.models import Loop
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +41,6 @@ def _is_valid_cron(expr: str) -> bool:
     parts = expr.strip().split()
     if len(parts) != 5:
         return False
-    # Each field must contain only digits, *, /, -, and commas.
     field_re = re.compile(r"^[\d*/,\-]+$")
     return all(field_re.match(p) for p in parts)
 
@@ -78,7 +69,6 @@ def _parse_loops_text(text: str) -> list[Loop]:
     loops: list[Loop] = []
     heading_re = re.compile(r"^##\s+(.+)$")
 
-    # Split into sections by ## headings.
     sections: list[tuple[str, list[str]]] = []
     current_name: Optional[str] = None
     current_lines: list[str] = []
@@ -86,7 +76,6 @@ def _parse_loops_text(text: str) -> list[Loop]:
     for line in text.splitlines():
         m = heading_re.match(line)
         if m:
-            # Save previous section (if any).
             if current_name is not None:
                 sections.append((current_name, current_lines))
             current_name = m.group(1).strip()
@@ -94,7 +83,6 @@ def _parse_loops_text(text: str) -> list[Loop]:
         else:
             current_lines.append(line)
 
-    # Don't forget the last section.
     if current_name is not None:
         sections.append((current_name, current_lines))
 
@@ -102,7 +90,6 @@ def _parse_loops_text(text: str) -> list[Loop]:
         meta: dict[str, str] = {}
         body_start = 0
 
-        # Parse metadata lines until we hit a blank line or a non-metadata line.
         for i, line in enumerate(lines):
             stripped = line.strip()
             if stripped == "":
@@ -113,7 +100,6 @@ def _parse_loops_text(text: str) -> list[Loop]:
                 meta[kv[0]] = kv[1]
                 body_start = i + 1
             else:
-                # Non-metadata, non-blank line — body starts here.
                 body_start = i
                 break
 
@@ -168,7 +154,6 @@ def write_loop(loop: Loop, path: Optional[Path] = None) -> None:
     if replaced:
         path.write_text(new_text, encoding="utf-8")
     else:
-        # Append — ensure there's a blank line before the new section.
         if text and not text.endswith("\n"):
             text += "\n"
         if text and not text.endswith("\n\n"):
@@ -185,7 +170,6 @@ def remove_loop(name: str, path: Optional[Path] = None) -> None:
     text = path.read_text(encoding="utf-8")
     replaced, new_text = _replace_section(text, name, None)
     if replaced:
-        # Clean up excessive blank lines left behind.
         new_text = re.sub(r"\n{3,}", "\n\n", new_text).strip()
         if new_text:
             new_text += "\n"
@@ -224,9 +208,7 @@ def _replace_section(
     Returns (was_found, new_text).
     """
     heading_re = re.compile(r"^##\s+", re.MULTILINE)
-    target_re = re.compile(
-        r"^##\s+" + re.escape(name) + r"\s*$", re.MULTILINE
-    )
+    target_re = re.compile(r"^##\s+" + re.escape(name) + r"\s*$", re.MULTILINE)
 
     m = target_re.search(text)
     if not m:
@@ -234,7 +216,6 @@ def _replace_section(
 
     start = m.start()
 
-    # Find the start of the *next* ## heading after this one.
     rest = text[m.end():]
     next_heading = heading_re.search(rest)
     if next_heading:
@@ -243,7 +224,6 @@ def _replace_section(
         end = len(text)
 
     if replacement is not None:
-        # Ensure replacement ends with a newline.
         if not replacement.endswith("\n"):
             replacement += "\n"
         new_text = text[:start] + replacement + text[end:]
@@ -251,208 +231,3 @@ def _replace_section(
         new_text = text[:start] + text[end:]
 
     return True, new_text
-
-
-# ---------------------------------------------------------------------------
-# scheduled_tasks.json parsing
-# ---------------------------------------------------------------------------
-
-def parse_jobs(path: Optional[Path] = None) -> list[Job]:
-    """Read scheduled_tasks.json and return Job objects.
-
-    Handles missing file or invalid JSON gracefully (returns []).
-    """
-    path = path or CANONICAL_TASKS
-    if not path.exists():
-        return []
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-
-    if not isinstance(data, list):
-        return []
-
-    jobs: list[Job] = []
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            jobs.append(Job(
-                id=str(entry.get("id", "")),
-                name=str(entry.get("name", entry.get("description", ""))),
-                interval=str(entry.get("interval", entry.get("schedule", ""))),
-                prompt=str(entry.get("prompt", "")),
-                created_at=str(entry.get("createdAt", entry.get("created_at", ""))),
-            ))
-        except Exception:
-            continue
-
-    return jobs
-
-
-# ---------------------------------------------------------------------------
-# Diff / reconcile
-# ---------------------------------------------------------------------------
-
-def diff(loops: list[Loop], jobs: list[Job]) -> CheckResult:
-    """Diff declared loops against live jobs to produce a CheckResult."""
-    statuses: list[LoopStatus] = []
-    matched_job_ids: set[str] = set()
-
-    for loop in loops:
-        if not loop.active:
-            statuses.append(LoopStatus(loop=loop, state="paused"))
-            continue
-
-        job = _find_matching_job(loop, jobs)
-        if job is None:
-            statuses.append(LoopStatus(loop=loop, state="missing"))
-        else:
-            matched_job_ids.add(job.id)
-            days_left = _days_until_expiry(job)
-            if days_left is not None and days_left <= RENEW_BEFORE_DAYS:
-                statuses.append(LoopStatus(
-                    loop=loop,
-                    job=job,
-                    state="expiring",
-                    days_until_expiry=round(days_left, 1),
-                ))
-            else:
-                statuses.append(LoopStatus(
-                    loop=loop,
-                    job=job,
-                    state="active",
-                    days_until_expiry=round(days_left, 1) if days_left is not None else None,
-                ))
-
-    # Orphan jobs — live jobs that don't match any declared loop.
-    orphan_jobs: list[Job] = [j for j in jobs if j.id not in matched_job_ids]
-
-    needs_sync = any(
-        s.state in ("missing", "expiring") for s in statuses
-    ) or bool(orphan_jobs)
-
-    result = CheckResult(
-        statuses=statuses,
-        orphan_jobs=orphan_jobs,
-        needs_sync=needs_sync,
-    )
-    result.message = _build_message(result)
-    return result
-
-
-def _find_matching_job(loop: Loop, jobs: list[Job]) -> Optional[Job]:
-    """Find a job whose name contains the loop's name (case-insensitive)."""
-    lower_name = loop.name.lower()
-    for job in jobs:
-        if lower_name in job.name.lower():
-            return job
-    return None
-
-
-def _days_until_expiry(job: Job) -> Optional[float]:
-    """Compute days remaining before *job* expires (EXPIRY_DAYS after createdAt)."""
-    if not job.created_at:
-        return None
-    try:
-        created = _parse_iso(job.created_at)
-        expiry = created.timestamp() + EXPIRY_DAYS * 86400
-        now = datetime.now(timezone.utc).timestamp()
-        return (expiry - now) / 86400
-    except (ValueError, OSError):
-        return None
-
-
-def _parse_iso(s: str) -> datetime:
-    """Parse an ISO 8601 datetime string to a tz-aware datetime."""
-    # Handle both 'Z' suffix and +00:00 style offsets.
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
-
-
-def _build_message(result: CheckResult) -> str:
-    """Build a human-readable summary message for the CheckResult."""
-    parts: list[str] = []
-
-    if result.active_count:
-        parts.append(f"{result.active_count} active")
-    if result.missing_count:
-        parts.append(f"{result.missing_count} missing")
-    if result.expiring_count:
-        parts.append(f"{result.expiring_count} expiring")
-
-    paused = sum(1 for s in result.statuses if s.state == "paused")
-    if paused:
-        parts.append(f"{paused} paused")
-
-    if result.orphan_jobs:
-        parts.append(f"{len(result.orphan_jobs)} orphan")
-
-    if not parts:
-        return "No loops registered."
-
-    summary = ", ".join(parts)
-
-    if result.needs_sync:
-        return f"{summary} -- sync needed"
-    return summary
-
-
-# ---------------------------------------------------------------------------
-# Symlink management
-# ---------------------------------------------------------------------------
-
-def ensure_symlink(project_dir: Optional[Path] = None) -> bool:
-    """Create or verify the symlink from project's scheduled_tasks.json to canonical.
-
-    Returns True if the symlink is correct (created or already existed).
-    Returns False if a non-symlink file already exists and cannot be replaced.
-    """
-    project_dir = project_dir or Path.cwd()
-    link_path = project_dir / ".claude" / "scheduled_tasks.json"
-    target = CANONICAL_TASKS
-
-    # Ensure the canonical side exists.
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        target.write_text("[]", encoding="utf-8")
-
-    # Ensure the project .claude dir exists.
-    link_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if link_path.is_symlink():
-        if link_path.resolve() == target.resolve():
-            return True
-        # Symlink points elsewhere — relink.
-        link_path.unlink()
-        link_path.symlink_to(target)
-        return True
-
-    if link_path.exists():
-        # A real file already exists.  Don't clobber it — the caller should
-        # decide what to do.
-        return False
-
-    link_path.symlink_to(target)
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Full check (convenience)
-# ---------------------------------------------------------------------------
-
-def check(project_dir: Optional[Path] = None) -> CheckResult:
-    """Full check: parse loops, parse jobs, diff, optionally ensure_symlink.
-
-    Returns a CheckResult with needs_sync and a human-readable message.
-    """
-    if project_dir is not None:
-        ensure_symlink(project_dir)
-
-    loops = parse_loops()
-    jobs = parse_jobs()
-    return diff(loops, jobs)
