@@ -226,7 +226,7 @@ def show(name: str) -> None:
     console.print(f"[bold]Loop:[/] {target.name}")
     console.print(f"[bold]Interval:[/] {target.interval}")
     console.print()
-    console.rule("Prompt (paste into Claude for one-shot run)")
+    console.rule("Prompt")
     console.print()
     # Print raw prompt to stdout so it can be piped/copied
     click.echo(target.prompt)

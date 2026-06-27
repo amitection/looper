@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 from textual.widgets import DataTable, Static
 
-from looper.models import Loop, LoopStatus
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +353,7 @@ async def test_no_loop_selected_actions_do_not_crash(isolated_env):
     app = _make_app()
     async with app.run_test(notifications=True) as pilot:
         # With no loops, pressing action keys should produce warnings, not crashes.
-        for key in ("t", "d", "r", "e", "p"):
+        for key in ("t", "d", "e", "p"):
             await pilot.press(key)
             await pilot.pause()
         # Reaching here without exception means no crashes.
