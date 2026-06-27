@@ -403,54 +403,54 @@ class TestDelete:
 
 
 # ===========================================================================
-# 6. looper retrigger
+# 6. looper show
 # ===========================================================================
 
 
-class TestRetrigger:
-    def test_retrigger_existing(self, runner: CliRunner, isolated_env) -> None:
-        """Retrigger prints the loop's prompt and CronCreate command."""
+class TestShow:
+    def test_show_existing(self, runner: CliRunner, isolated_env) -> None:
+        """Show prints the loop's prompt and CronCreate command."""
         _, loops_file = isolated_env
         _seed_loops(loops_file)
 
-        result = runner.invoke(main, ["retrigger", "check-deploys"])
+        result = runner.invoke(main, ["show", "check-deploys"])
         assert result.exit_code == 0
         assert "check-deploys" in result.output
         assert "Check the latest deployment status" in result.output
         assert "CronCreate" in result.output
         assert "30m" in result.output
 
-    def test_retrigger_nonexistent(self, runner: CliRunner, isolated_env) -> None:
-        """Retrigger for a missing loop fails."""
+    def test_show_nonexistent(self, runner: CliRunner, isolated_env) -> None:
+        """Show for a missing loop fails."""
         _, loops_file = isolated_env
         _seed_loops(loops_file)
 
-        result = runner.invoke(main, ["retrigger", "missing-loop"])
+        result = runner.invoke(main, ["show", "missing-loop"])
         assert result.exit_code != 0
         assert "not found" in result.output.lower()
 
-    def test_retrigger_paused_loop(self, runner: CliRunner, isolated_env) -> None:
-        """Retrigger works on paused loops too (shows prompt regardless)."""
+    def test_show_paused_loop(self, runner: CliRunner, isolated_env) -> None:
+        """Show works on paused loops too (shows prompt regardless)."""
         _, loops_file = isolated_env
         _seed_loops(loops_file)
 
-        result = runner.invoke(main, ["retrigger", "daily-report"])
+        result = runner.invoke(main, ["show", "daily-report"])
         assert result.exit_code == 0
         assert "daily-report" in result.output
         assert "Generate the daily metrics report" in result.output
 
-    def test_retrigger_shows_interval(self, runner: CliRunner, isolated_env) -> None:
-        """Retrigger output includes the loop's interval."""
+    def test_show_interval(self, runner: CliRunner, isolated_env) -> None:
+        """Show output includes the loop's interval."""
         _, loops_file = isolated_env
         _seed_loops(loops_file)
 
-        result = runner.invoke(main, ["retrigger", "cleanup"])
+        result = runner.invoke(main, ["show", "cleanup"])
         assert result.exit_code == 0
         assert "1h" in result.output
 
-    def test_retrigger_empty_registry(self, runner: CliRunner, isolated_env) -> None:
-        """Retrigger with no loops.md fails."""
-        result = runner.invoke(main, ["retrigger", "anything"])
+    def test_show_empty_registry(self, runner: CliRunner, isolated_env) -> None:
+        """Show with no loops.md fails."""
+        result = runner.invoke(main, ["show", "anything"])
         assert result.exit_code != 0
         assert "not found" in result.output.lower()
 
@@ -491,12 +491,12 @@ class TestHelp:
         """--help shows available subcommands."""
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ["list", "add", "pause", "resume", "delete", "retrigger", "sync", "release"]:
+        for cmd in ["list", "add", "pause", "resume", "delete", "show", "sync", "release"]:
             assert cmd in result.output, f"Command '{cmd}' not listed in help"
 
     def test_subcommand_help(self, runner: CliRunner) -> None:
         """Each subcommand supports --help."""
-        for cmd in ["list", "add", "pause", "resume", "delete", "retrigger", "sync", "release"]:
+        for cmd in ["list", "add", "pause", "resume", "delete", "show", "sync", "release"]:
             result = runner.invoke(main, [cmd, "--help"])
             assert result.exit_code == 0, f"{cmd} --help failed"
             assert "Usage" in result.output or "usage" in result.output, (
@@ -543,11 +543,11 @@ class TestLifecycle:
         loops = parse_loops(loops_file)
         assert not any(l.name == "lifecycle" for l in loops)
 
-    def test_add_then_retrigger(self, runner: CliRunner, isolated_env) -> None:
-        """Add a loop then retrigger shows its prompt."""
+    def test_add_then_show(self, runner: CliRunner, isolated_env) -> None:
+        """Add a loop then show prints its prompt."""
         runner.invoke(main, ["add", "trigger-me", "5m", "-p", "Unique prompt text here."])
 
-        result = runner.invoke(main, ["retrigger", "trigger-me"])
+        result = runner.invoke(main, ["show", "trigger-me"])
         assert result.exit_code == 0
         assert "Unique prompt text here." in result.output
 

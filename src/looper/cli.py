@@ -204,14 +204,14 @@ def delete(name: str, force: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# looper retrigger
+# looper show
 # ---------------------------------------------------------------------------
 
 
 @main.command()
 @click.argument("name")
-def retrigger(name: str) -> None:
-    """Print a loop's prompt for one-shot execution or CronCreate re-registration."""
+def show(name: str) -> None:
+    """Print a loop's details, prompt, and CronCreate command."""
     loops = parse_loops()
     target = None
     for loop in loops:

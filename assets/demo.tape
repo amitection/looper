@@ -55,12 +55,6 @@ Sleep 1.2s
 Up
 Sleep 1.2s
 
-# retrigger -> prompt view
-Type "r"
-Sleep 2s
-Escape
-Sleep 800ms
-
 # toggle status
 Type "t"
 Sleep 1.5s

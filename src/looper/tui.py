@@ -245,59 +245,6 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class PromptViewScreen(ModalScreen[None]):
-    """Modal to display a loop's prompt (for copy/retrigger)."""
-
-    CSS = """
-    PromptViewScreen {
-        align: center middle;
-    }
-    #prompt-dialog {
-        width: 80;
-        height: auto;
-        max-height: 80%;
-        border: thick $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #prompt-dialog Label {
-        margin: 1 0 0 0;
-    }
-    #prompt-dialog TextArea {
-        height: 12;
-        margin: 0 0 1 0;
-    }
-    #prompt-buttons {
-        height: auto;
-        align: right middle;
-        margin-top: 1;
-    }
-    """
-
-    BINDINGS = [
-        Binding("escape", "close", "Close", show=True),
-    ]
-
-    def __init__(self, loop_name: str, prompt: str) -> None:
-        super().__init__()
-        self._loop_name = loop_name
-        self._prompt = prompt
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="prompt-dialog"):
-            yield Label(f"Prompt: {self._loop_name}", classes="title")
-            yield TextArea(self._prompt, id="prompt-text", read_only=True)
-            with Horizontal(id="prompt-buttons"):
-                yield Button("Close", variant="default", id="prompt-close")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "prompt-close":
-            self.dismiss(None)
-
-    def action_close(self) -> None:
-        self.dismiss(None)
-
-
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -358,7 +305,6 @@ class LooperApp(App):
         Binding("e", "edit_loop", "Edit"),
         Binding("t", "toggle_loop", "Toggle"),
         Binding("p", "pause_loop", "Pause"),
-        Binding("r", "retrigger", "Retrigger"),
         Binding("d", "delete_loop", "Delete"),
         Binding("g", "refresh", "Refresh"),
     ]
@@ -556,13 +502,6 @@ class LooperApp(App):
         except Exception as exc:
             self.notify(f"Error pausing loop: {exc}", severity="error")
         self._refresh_data()
-
-    def action_retrigger(self) -> None:
-        loop = self._get_selected_loop()
-        if loop is None:
-            self.notify("No loop selected.", severity="warning")
-            return
-        self.push_screen(PromptViewScreen(loop.name, loop.prompt))
 
     def action_delete_loop(self) -> None:
         loop = self._get_selected_loop()

@@ -82,7 +82,7 @@ looper add nightly "0 2 * * *" --prompt "..."  # add a loop by hand
 looper pause <name>                            # keep it, but don't arm it
 looper resume <name>
 looper delete <name> --force                   # remove permanently
-looper retrigger <name>                        # print a loop's prompt for a one-shot run
+looper show <name>                             # print a loop's details and prompt
 looper tui                                      # interactive dashboard
 ```
 

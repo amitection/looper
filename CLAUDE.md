@@ -24,7 +24,7 @@ src/looper/
   harvest.py      # Capture: reconcile session_crons -> loops.md; per-session
                   #          notes; running_loop_names() for status
   lease.py        # Single-owner lease (claim/refresh/release, pid liveness)
-  cli.py          # Click CLI: list, add, pause, resume, delete, retrigger,
+  cli.py          # Click CLI: list, add, pause, resume, delete, show,
                   #            sync, release, install, tui
   tui.py          # Textual TUI for interactive loop management
   installer.py    # Setup: ~/.looper, hooks, /start-loops /stop-loops /delete-loop

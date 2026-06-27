@@ -305,47 +305,6 @@ async def test_confirm_delete_removes_loop(populated_env):
 
 
 # ---------------------------------------------------------------------------
-# 9. Pressing 'r' on a selected loop opens PromptViewScreen
-# ---------------------------------------------------------------------------
-
-
-async def test_press_r_opens_prompt_view(populated_env):
-    from looper.tui import PromptViewScreen
-    app = _make_app()
-    async with app.run_test() as pilot:
-        await pilot.press("r")
-        await pilot.pause()
-        assert isinstance(app.screen, PromptViewScreen)
-
-
-async def test_prompt_view_shows_prompt_text(populated_env):
-    from looper.tui import PromptViewScreen
-    from textual.widgets import TextArea
-    app = _make_app()
-    async with app.run_test() as pilot:
-        await pilot.press("r")
-        await pilot.pause()
-        assert isinstance(app.screen, PromptViewScreen)
-
-        text_area = app.screen.query_one("#prompt-text", TextArea)
-        # The prompt text should not be empty.
-        assert len(text_area.text.strip()) > 0
-
-
-async def test_prompt_view_escape_closes(populated_env):
-    from looper.tui import PromptViewScreen
-    app = _make_app()
-    async with app.run_test() as pilot:
-        await pilot.press("r")
-        await pilot.pause()
-        assert isinstance(app.screen, PromptViewScreen)
-
-        await pilot.press("escape")
-        await pilot.pause()
-        assert not isinstance(app.screen, PromptViewScreen)
-
-
-# ---------------------------------------------------------------------------
 # 10. Pressing 'g' refreshes
 # ---------------------------------------------------------------------------
 
